@@ -26,6 +26,17 @@ local Progression = {}
 local S: any
 
 local SETTINGS: { [string]: string } = { ColorblindPalette = "boolean" }
+local lastRequest: { [Player]: number } = {}
+
+-- Locker actions rebuild cosmetics and resend the profile, so cap them per player.
+local function throttled(player: Player): boolean
+	local now = os.clock()
+	if now - (lastRequest[player] or 0) < 0.25 then
+		return true
+	end
+	lastRequest[player] = now
+	return false
+end
 
 local function profileOf(player: Player): any
 	return S.PlayerData.Get(player)
@@ -200,7 +211,7 @@ local function onEliminated(victim: Player, killer: Player?, weaponId: string, c
 end
 
 local function onEquip(player: Player, category: unknown, id: unknown)
-	if typeof(category) ~= "string" or typeof(id) ~= "string" then
+	if typeof(category) ~= "string" or typeof(id) ~= "string" or throttled(player) then
 		return
 	end
 	local profile = profileOf(player)
@@ -214,7 +225,12 @@ local function onEquip(player: Player, category: unknown, id: unknown)
 end
 
 local function onSetting(player: Player, key: unknown, value: unknown)
-	if typeof(key) ~= "string" or SETTINGS[key :: string] == nil or typeof(value) ~= SETTINGS[key :: string] then
+	if
+		typeof(key) ~= "string"
+		or SETTINGS[key :: string] == nil
+		or typeof(value) ~= SETTINGS[key :: string]
+		or throttled(player)
+	then
 		return
 	end
 	local profile = profileOf(player)
@@ -262,9 +278,14 @@ local function processReceipt(receipt: any): Enum.ProductPurchaseDecision
 		warn("[Progression] receipt for unknown product " .. tostring(receipt.ProductId))
 		return Enum.ProductPurchaseDecision.NotProcessedYet
 	end
-	profile.Receipts[purchaseKey] = true
-	S.PlayerData.Save(player, false)
 	Progression.Sync(player)
+	-- Only confirm to Roblox once the grant is safely saved; otherwise Roblox retries the
+	-- receipt later and the grant (idempotent) is saved then.
+	profile.Receipts[purchaseKey] = true
+	if not S.PlayerData.Save(player, false) then
+		profile.Receipts[purchaseKey] = nil
+		return Enum.ProductPurchaseDecision.NotProcessedYet
+	end
 	return Enum.ProductPurchaseDecision.PurchaseGranted
 end
 
@@ -278,6 +299,9 @@ function Progression.Start()
 		Progression.Sync(player)
 	end)
 	S.Match.Eliminated:Connect(onEliminated)
+	Players.PlayerRemoving:Connect(function(player)
+		lastRequest[player] = nil
+	end)
 	Net.Event("Equip").OnServerEvent:Connect(onEquip)
 	Net.Event("SetSetting").OnServerEvent:Connect(onSetting)
 

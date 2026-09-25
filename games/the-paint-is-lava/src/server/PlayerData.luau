@@ -91,6 +91,23 @@ local function tryStore(): DataStore?
 	return nil
 end
 
+-- Drop our session lock without writing data (player left before their profile loaded).
+local function releaseLock(player: Player)
+	local ds = store
+	if not ds then
+		return
+	end
+	pcall(function()
+		ds:UpdateAsync(key(player), function(record: any)
+			if record and record.Lock and record.Lock.JobId == game.JobId then
+				record.Lock = nil
+				return record
+			end
+			return nil
+		end)
+	end)
+end
+
 local function load(player: Player)
 	local profile: Profile = defaults()
 	local saved = false
@@ -134,6 +151,9 @@ local function load(player: Player)
 		profile.Season = { Id = Season.Id, XP = 0, Premium = false }
 	end
 	if player.Parent ~= Players then
+		if saved then
+			releaseLock(player)
+		end
 		return
 	end
 	profiles[player] = profile
@@ -144,26 +164,31 @@ local function load(player: Player)
 	PlayerData.Loaded:Fire(player, profile)
 end
 
-function PlayerData.Save(player: Player, release: boolean)
+-- Returns true only if the profile was actually written to the DataStore.
+function PlayerData.Save(player: Player, release: boolean): boolean
 	local profile = profiles[player]
 	local ds = store
 	if not profile or not ds or not persistent[player] then
-		return
+		return false
 	end
+	local written = false
 	local ok, err = pcall(function()
 		ds:UpdateAsync(key(player), function(record: any)
 			record = record or {}
 			if record.Lock and record.Lock.JobId ~= game.JobId then
+				written = false
 				return nil -- another server took over; don't clobber its data
 			end
 			record.Data = profile
 			record.Lock = if release then nil else { JobId = game.JobId, Time = os.time() }
+			written = true
 			return record
 		end)
 	end)
 	if not ok then
 		warn("[PlayerData] save failed for " .. player.Name .. ": " .. tostring(err))
 	end
+	return ok and written
 end
 
 function PlayerData.Get(player: Player): Profile?

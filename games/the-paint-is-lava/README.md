@@ -54,8 +54,9 @@ Playing alone in Studio starts a match immediately, and a Studio-only test paint
 
 1. Publish the place from Studio (File → Publish to Roblox) as a new experience.
 2. Game Settings → Security: enable **Studio Access to API Services** so profiles save when testing in Studio.
-3. Game Settings → Places: set the server size (start at 12; see the playtest plan before raising it).
-4. Monetization: create a game pass for the premium season track and put its id in `src/shared/Config/Season.luau` (`PremiumGamePassId`); create developer products for shop cosmetics and put their ids in `src/shared/Config/Cosmetics.luau`. Until then, premium and shop items are hidden or locked.
+3. Game Settings → Avatar: set **Avatar Type to R15** so every character shares the same rig. Leave Workspace **StreamingEnabled off** (the place file ships that way); the paint system needs every surface loaded.
+4. Game Settings → Places: set the server size (start at 12; see the playtest plan before raising it).
+5. Monetization: create a game pass for the premium season track and put its id in `src/shared/Config/Season.luau` (`PremiumGamePassId`); create developer products for shop cosmetics and put their ids in `src/shared/Config/Cosmetics.luau`. Until then, premium and shop items are hidden or locked.
 
 ## For agents and developers
 

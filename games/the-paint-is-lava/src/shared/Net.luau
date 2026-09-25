@@ -20,7 +20,7 @@ local NAMES = {
 	"Reload", -- C->S (weaponId)
 	"ThrowGrenade", -- C->S (origin, direction)
 	"Swing", -- C->S (lookDirection) paintbrush
-	"ProjectileFired", -- S->C (shooterUserId, weaponId, origin, velocity) for visuals
+	"ProjectileFired", -- S->C buffer of this frame's shots (ShotCodec) for visuals
 	"AmmoSync", -- S->C (weaponId, ammo, reloading, grenades)
 	"HitConfirm", -- S->C to shooter (damage, eliminated)
 	"DamageTaken", -- S->C to victim (amount, kind "Direct"|"Splash"|"Hazard", fromPosition?)

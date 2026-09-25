@@ -23,6 +23,8 @@ local MovementService = {}
 
 local S: any
 local arena: Instance
+local arenaParams = RaycastParams.new()
+arenaParams.FilterType = Enum.RaycastFilterType.Include
 
 export type Grapple = {
 	Part: BasePart,
@@ -30,6 +32,7 @@ export type Grapple = {
 	Normal: Vector3,
 	Since: number,
 	Visual: Instance?,
+	Distance: number, -- how far away the anchor was when attached
 }
 
 local VALID_STATES = { None = true, Air = true, WallRun = true, Grapple = true }
@@ -39,6 +42,29 @@ local grapples: { [Player]: Grapple } = {}
 local lastAttach: { [Player]: number } = {}
 local lastPos: { [Player]: Vector3 } = {}
 local wallRunCarry: { [Player]: number } = {}
+local lastStateMsg: { [Player]: number } = {}
+
+local function rootOf(player: Player): BasePart?
+	local character = player.Character
+	return character and character:FindFirstChild("HumanoidRootPart") :: BasePart?
+end
+
+-- Server-side check: nothing to stand on just below the character.
+local function airborneOnServer(root: BasePart): boolean
+	return workspace:Raycast(root.Position, Vector3.new(0, -4.5, 0), arenaParams) == nil
+end
+
+-- Server-side check: a wall close beside the character (as a wall-run needs).
+local function wallBeside(root: BasePart): boolean
+	local reach = root.CFrame.RightVector * (Tuning.Movement.WallRun.DetectDistance + 1)
+	for _, dir in { reach, -reach } do
+		local hit = workspace:Raycast(root.Position, dir, arenaParams)
+		if hit and math.abs(hit.Normal.Y) < 0.3 then
+			return true
+		end
+	end
+	return false
+end
 
 function MovementService.StateOf(player: Player): string
 	return states[player] or "None"
@@ -48,10 +74,15 @@ function MovementService.GrappleOf(player: Player): Grapple?
 	return grapples[player]
 end
 
--- Airborne, wall-running or grappling: counts toward "aerial" achievements.
+-- Airborne, wall-running or grappling: counts toward "aerial" achievements. The client's
+-- claim alone is not trusted; the server confirms there is no ground under them.
 function MovementService.IsAerial(player: Player): boolean
+	if grapples[player] then
+		return true
+	end
 	local s = states[player]
-	return s == "Air" or s == "WallRun" or s == "Grapple"
+	local root = rootOf(player)
+	return (s == "Air" or s == "WallRun") and root ~= nil and airborneOnServer(root)
 end
 
 local function setState(player: Player, state: string)
@@ -68,6 +99,10 @@ local function clearGrapple(player: Player)
 		grapples[player] = nil
 		if g.Visual then
 			g.Visual:Destroy()
+		end
+		-- Only real grapples count toward achievements: a proper distance, held a moment.
+		if g.Distance >= 10 and os.clock() - g.Since >= 0.5 and player.Parent == Players then
+			S.Progression.AddStat(player, "Grapples", 1)
 		end
 	end
 end
@@ -139,17 +174,21 @@ local function onAttach(player: Player, part: unknown, position: unknown, normal
 		return
 	end
 
+	local n = normal :: Vector3
+	if n.Magnitude ~= n.Magnitude or n.Magnitude < 0.5 then
+		return
+	end
 	clearGrapple(player)
 	lastAttach[player] = now
 	grapples[player] = {
 		Part = p :: BasePart,
 		Position = pos,
-		Normal = (normal :: Vector3).Unit,
+		Normal = n.Unit,
 		Since = now,
 		Visual = makeRopeVisual(player, pos),
+		Distance = (pos - root.Position).Magnitude,
 	}
 	setState(player, "Grapple")
-	S.Progression.AddStat(player, "Grapples", 1)
 end
 
 local function onRelease(player: Player)
@@ -163,6 +202,11 @@ local function onMoveState(player: Player, state: unknown)
 	if typeof(state) ~= "string" or not VALID_STATES[state :: string] then
 		return
 	end
+	local now = os.clock()
+	if now - (lastStateMsg[player] or 0) < 0.05 then
+		return
+	end
+	lastStateMsg[player] = now
 	if state ~= "Grapple" and grapples[player] then
 		clearGrapple(player)
 	end
@@ -172,6 +216,7 @@ end
 function MovementService.Init(services: any, arenaRoot: Instance)
 	S = services
 	arena = arenaRoot
+	arenaParams.FilterDescendantsInstances = { arenaRoot }
 end
 
 function MovementService.Start()
@@ -199,6 +244,7 @@ function MovementService.Start()
 		states[player] = nil
 		lastAttach[player] = nil
 		wallRunCarry[player] = nil
+		lastStateMsg[player] = nil
 	end)
 
 	local elapsed = 0
@@ -217,7 +263,8 @@ function MovementService.Start()
 				local pos = root.Position
 				local prev = lastPos[player]
 				lastPos[player] = pos
-				if state == "WallRun" and prev then
+				-- Count wall-run distance only when the server also sees a wall and no floor.
+				if state == "WallRun" and prev and wallBeside(root) and airborneOnServer(root) then
 					-- Cap per-window distance at a plausible wall-run speed to resist spoofing.
 					local d = math.min((pos - prev).Magnitude, Tuning.Movement.WallRun.Speed * window * 1.5)
 					wallRunCarry[player] = (wallRunCarry[player] or 0) + d

@@ -24,6 +24,7 @@ local Net = require(Shared.Net)
 local Ballistics = require(Shared.Ballistics)
 local Factions = require(Shared.Paint.Factions)
 local WeaponModels = require(Shared.WeaponModels)
+local ShotCodec = require(Shared.ShotCodec)
 
 local CombatService = {}
 
@@ -35,6 +36,7 @@ type PlayerCombat = {
 	Ammo: { [string]: number },
 	ReloadingUntil: { [string]: number },
 	LastShot: { [string]: number },
+	Tokens: { [string]: number },
 	Grenades: number,
 	LastGrenade: number,
 	LastDamage: DamageRecord?,
@@ -54,9 +56,10 @@ type Projectile = {
 
 local combat: { [Player]: PlayerCombat } = {}
 local projectiles: { Projectile } = {}
+local pendingShots: { ShotCodec.Shot } = {}
 
-local ORIGIN_TOLERANCE = 10
-local RATE_TOLERANCE = 0.8 -- accept shots up to 20% early (network jitter)
+local ORIGIN_TOLERANCE = 4.5 -- studs from the head (first-person camera sits there)
+local BURST_TOKENS = 2 -- fire-rate bucket size: absorbs network jitter, not sustained cheating
 local MAX_PROJECTILE_LIFE = 8
 local KILL_CREDIT_WINDOW = 12
 
@@ -67,6 +70,7 @@ local function stateFor(player: Player): PlayerCombat
 			Ammo = {},
 			ReloadingUntil = {},
 			LastShot = {},
+			Tokens = {},
 			Grenades = Tuning.Grenade.Count,
 			LastGrenade = 0,
 			LastDamage = nil,
@@ -164,14 +168,23 @@ function CombatService.KillerOf(victim: Player): (Player?, string, string)
 	return nil, "Paint", "Hazard"
 end
 
-local function splash(center: Vector3, weapon: Weapons.WeaponStats, owner: Player, faction: number, exclude: Player?)
+-- Splash damage to hostiles in radius who can be seen from the burst (walls block it).
+local function splash(
+	center: Vector3,
+	normal: Vector3?,
+	weapon: Weapons.WeaponStats,
+	owner: Player,
+	faction: number,
+	exclude: Player?
+)
 	if weapon.SplashRadius <= 0 or weapon.SplashDamage <= 0 then
 		return
 	end
+	local from = if normal then center + normal * 0.3 else center
 	for _, other in Players:GetPlayers() do
 		if other ~= exclude and Factions.AreEnemies(faction, S.Match.FactionOf(other)) then
 			local _, _, root = aliveCharacter(other)
-			if root then
+			if root and S.Paint.LineOfSight(from, root.Position) then
 				local dmg = Ballistics.SplashDamage(
 					weapon.SplashDamage,
 					weapon.SplashRadius,
@@ -199,12 +212,17 @@ local function spawnProjectile(owner: Player, weapon: Weapons.WeaponStats, origi
 		Born = os.clock(),
 		Ignore = if character then { character } else {},
 	})
-	Net.Event("ProjectileFired"):FireAllClients(owner.UserId, weapon.Id, origin, direction * weapon.ProjectileSpeed)
+	table.insert(pendingShots, {
+		UserId = owner.UserId,
+		WeaponId = weapon.Id,
+		Origin = origin,
+		Velocity = direction * weapon.ProjectileSpeed,
+	})
 end
 
 local function burst(p: Projectile, at: Vector3)
 	S.Paint.PaintSphere(at, p.Weapon.PaintRadius, p.Faction, p.Owner)
-	splash(at, p.Weapon, p.Owner, p.Faction, nil)
+	splash(at, nil, p.Weapon, p.Owner, p.Faction, nil)
 end
 
 local rayParams = RaycastParams.new()
@@ -234,14 +252,16 @@ local function step(p: Projectile, dt: number): boolean
 		end
 		local victim = playerFromPart(hit.Instance)
 		if victim then
-			if victim ~= p.Owner and Factions.AreEnemies(p.Faction, S.Match.FactionOf(victim)) then
+			local alive = aliveCharacter(victim) ~= nil
+			if alive and victim ~= p.Owner and Factions.AreEnemies(p.Faction, S.Match.FactionOf(victim)) then
 				CombatService.DealDamage(victim, weapon.DirectDamage, p.Owner, "Direct", weapon.Id, p.Position)
 				if weapon.SplashRadius > 0 then
-					S.Paint.PaintSphere(hit.Position, weapon.PaintRadius, p.Faction, p.Owner)
-					splash(hit.Position, weapon, p.Owner, p.Faction, victim)
+					S.Paint.PaintSphere(hit.Position, weapon.PaintRadius, p.Faction, p.Owner, hit.Normal)
+					splash(hit.Position, hit.Normal, weapon, p.Owner, p.Faction, victim)
 				end
 				return false
 			end
+			-- Teammates and bodies of the eliminated don't stop paint.
 			local character = victim.Character
 			if character then
 				table.insert(p.Ignore, character)
@@ -251,8 +271,8 @@ local function step(p: Projectile, dt: number): boolean
 			p.Velocity = Ballistics.Bounce(newVel, hit.Normal, weapon.Bounciness or 0.4)
 			return true
 		else
-			S.Paint.PaintSphere(hit.Position, weapon.PaintRadius, p.Faction, p.Owner)
-			splash(hit.Position, weapon, p.Owner, p.Faction, nil)
+			S.Paint.PaintSphere(hit.Position, weapon.PaintRadius, p.Faction, p.Owner, hit.Normal)
+			splash(hit.Position, hit.Normal, weapon, p.Owner, p.Faction, nil)
 			return false
 		end
 	end
@@ -280,15 +300,35 @@ local function equippedWeapon(player: Player, weaponId: string): Weapons.WeaponS
 	return Weapons[weaponId]
 end
 
+-- The shot must start near the head and on the same side of any wall as the player.
 local function plausibleOrigin(player: Player, origin: Vector3): boolean
 	local _, _, root = aliveCharacter(player)
-	return root ~= nil and (root.Position - origin).Magnitude <= ORIGIN_TOLERANCE
+	if not root or not ShotCodec.IsFinite(origin) then
+		return false
+	end
+	local head = root.Position + Vector3.new(0, 1.5, 0)
+	return (head - origin).Magnitude <= ORIGIN_TOLERANCE and S.Paint.LineOfSight(head, origin)
+end
+
+-- Token-bucket rate limit: sustained rate can never exceed the weapon's FireRate.
+local function takeToken(s: PlayerCombat, key: string, rate: number): boolean
+	local now = os.clock()
+	local last = s.LastShot[key] or 0
+	local tokens = math.min(BURST_TOKENS, (s.Tokens[key] or BURST_TOKENS) + (now - last) * rate)
+	s.LastShot[key] = now
+	if tokens < 1 then
+		s.Tokens[key] = tokens
+		return false
+	end
+	s.Tokens[key] = tokens - 1
+	return true
 end
 
 local function beginReload(player: Player, weapon: Weapons.WeaponStats)
 	local s = stateFor(player)
 	local id = weapon.Id
 	if (s.ReloadingUntil[id] or 0) > os.clock() or (s.Ammo[id] or 0) >= weapon.MagazineSize then
+		syncAmmo(player, id) -- tell a client that got ahead of us what the real state is
 		return
 	end
 	s.ReloadingUntil[id] = os.clock() + weapon.ReloadTime
@@ -306,39 +346,37 @@ local function onFire(player: Player, weaponId: unknown, origin: unknown, direct
 	if typeof(weaponId) ~= "string" or typeof(origin) ~= "Vector3" or typeof(directions) ~= "table" then
 		return
 	end
-	local weapon = equippedWeapon(player, weaponId)
+	local id = weaponId :: string
+	local weapon = equippedWeapon(player, id)
 	if not weapon or weapon.Kind ~= "Projectile" or S.Match.FactionOf(player) == 0 then
+		if Weapons[id] and stateFor(player).Ammo[id] then
+			syncAmmo(player, id) -- the client predicted a shot we won't honour; correct it
+		end
 		return
 	end
 	local dirs = directions :: { any }
-	if #dirs ~= weapon.Pellets then
-		return
+	local valid = #dirs == weapon.Pellets
+	for _, d in dirs do
+		valid = valid and ShotCodec.IsUnitish(d)
 	end
 	local s = stateFor(player)
-	local now = os.clock()
-	if (s.ReloadingUntil[weaponId] or 0) > now then
-		syncAmmo(player, weaponId)
-		return
-	end
-	if now - (s.LastShot[weaponId] or 0) < (1 / weapon.FireRate) * RATE_TOLERANCE then
-		return
-	end
-	if (s.Ammo[weaponId] or 0) <= 0 then
-		syncAmmo(player, weaponId)
-		return
-	end
-	if not plausibleOrigin(player, origin :: Vector3) then
+	-- Every rejection re-syncs ammo so the client's predicted count never drifts.
+	if
+		not valid
+		or (s.ReloadingUntil[id] or 0) > os.clock()
+		or (s.Ammo[id] or 0) <= 0
+		or not plausibleOrigin(player, origin :: Vector3)
+		or not takeToken(s, id, weapon.FireRate)
+	then
+		syncAmmo(player, id)
 		return
 	end
 
-	s.LastShot[weaponId] = now
-	s.Ammo[weaponId] -= 1
+	s.Ammo[id] -= 1
 	for _, d in dirs do
-		if typeof(d) == "Vector3" and d.Magnitude > 0.5 and d.Magnitude < 1.5 then
-			spawnProjectile(player, weapon, origin :: Vector3, d.Unit)
-		end
+		spawnProjectile(player, weapon, origin :: Vector3, (d :: Vector3).Unit)
 	end
-	if s.Ammo[weaponId] <= 0 then
+	if s.Ammo[id] <= 0 then
 		beginReload(player, weapon)
 	end
 end
@@ -354,16 +392,18 @@ local function onReload(player: Player, weaponId: unknown)
 end
 
 local function onThrow(player: Player, origin: unknown, direction: unknown)
-	if typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" then
-		return
-	end
 	local s = stateFor(player)
 	local now = os.clock()
 	local weapon = Weapons.Grenade
-	if s.Grenades <= 0 or now - s.LastGrenade < 1 / weapon.FireRate or S.Match.FactionOf(player) == 0 then
-		return
-	end
-	if not plausibleOrigin(player, origin :: Vector3) or (direction :: Vector3).Magnitude < 0.5 then
+	if
+		typeof(origin) ~= "Vector3"
+		or not ShotCodec.IsUnitish(direction)
+		or s.Grenades <= 0
+		or now - s.LastGrenade < 1 / weapon.FireRate
+		or S.Match.FactionOf(player) == 0
+		or not plausibleOrigin(player, origin :: Vector3)
+	then
+		Net.Event("AmmoSync"):FireClient(player, "Grenade", s.Grenades, false, s.Grenades)
 		return
 	end
 	s.Grenades -= 1
@@ -375,19 +415,16 @@ local function onThrow(player: Player, origin: unknown, direction: unknown)
 end
 
 local function onSwing(player: Player, look: unknown)
-	if typeof(look) ~= "Vector3" or (look :: Vector3).Magnitude < 0.5 then
+	if not ShotCodec.IsUnitish(look) then
 		return
 	end
 	local weapon = equippedWeapon(player, "Paintbrush")
 	if not weapon or S.Match.FactionOf(player) == 0 then
 		return
 	end
-	local s = stateFor(player)
-	local now = os.clock()
-	if now - (s.LastShot.Paintbrush or 0) < (1 / weapon.FireRate) * RATE_TOLERANCE then
+	if not takeToken(stateFor(player), "Paintbrush", weapon.FireRate) then
 		return
 	end
-	s.LastShot.Paintbrush = now
 
 	local character, _, root = aliveCharacter(player)
 	if not character or not root then
@@ -431,13 +468,13 @@ local function onSwing(player: Player, look: unknown)
 			local rayDir = (dir + Vector3.new(0, pitch, 0)).Unit * (reach + 3)
 			local hit = workspace:Raycast(eye, rayDir, los)
 			if hit then
-				S.Paint.PaintSphere(hit.Position, weapon.PaintRadius, faction, player)
+				S.Paint.PaintSphere(hit.Position, weapon.PaintRadius, faction, player, hit.Normal)
 			end
 		end
 	end
 	local under = workspace:Raycast(root.Position, Vector3.new(0, -8, 0), los)
 	if under then
-		S.Paint.PaintSphere(under.Position, weapon.PaintRadius, faction, player)
+		S.Paint.PaintSphere(under.Position, weapon.PaintRadius, faction, player, under.Normal)
 	end
 end
 
@@ -448,6 +485,7 @@ function CombatService.OnSpawned(player: Player, character: Model)
 	local s = stateFor(player)
 	table.clear(s.ReloadingUntil)
 	table.clear(s.LastShot)
+	table.clear(s.Tokens)
 	s.LastDamage = nil
 	s.Grenades = Tuning.Grenade.Count
 	for _, id in Tuning.Loadout do
@@ -504,6 +542,10 @@ function CombatService.Start()
 
 	local regenAccumulator = 0
 	RunService.Heartbeat:Connect(function(dt)
+		if #pendingShots > 0 then
+			Net.Event("ProjectileFired"):FireAllClients(ShotCodec.Encode(pendingShots))
+			table.clear(pendingShots)
+		end
 		for i = #projectiles, 1, -1 do
 			local ok, keep = pcall(step, projectiles[i], dt)
 			if not ok or not keep then

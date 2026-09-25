@@ -11,6 +11,46 @@ return function(t: any)
 	local Tuning = t.Load("src/shared/Config/Tuning.luau")
 	local Modes = t.Load("src/shared/Config/Modes.luau")
 
+	describe("ShotCodec", function()
+		local ShotCodec = t.Load("src/shared/ShotCodec.luau")
+		it("round-trips a frame of shots, including large user ids", function()
+			local shots = {
+				{
+					UserId = 8123456789,
+					WeaponId = "Rifle",
+					Origin = Vector3.new(1, 2, 3),
+					Velocity = Vector3.new(-380, 0, 5),
+				},
+				{
+					UserId = 1,
+					WeaponId = "Launcher",
+					Origin = Vector3.new(-100.5, 30, 0),
+					Velocity = Vector3.new(0, 10, -140),
+				},
+			}
+			local got = {}
+			ShotCodec.Decode(ShotCodec.Encode(shots), function(shot)
+				table.insert(got, shot)
+			end)
+			expect(#got).toBe(2)
+			expect(got[1].UserId).toBe(8123456789)
+			expect(got[1].WeaponId).toBe("Rifle")
+			expect((got[1].Velocity - shots[1].Velocity).Magnitude).toBeNear(0, 1e-3)
+			expect(got[2].WeaponId).toBe("Launcher")
+			expect((got[2].Origin - shots[2].Origin).Magnitude).toBeNear(0, 1e-3)
+		end)
+		it("rejects NaN, infinite and non-unit vectors from clients", function()
+			local nan = 0 / 0
+			expect(ShotCodec.IsUnitish(Vector3.new(nan, 0, 0))).toBeFalsy()
+			expect(ShotCodec.IsUnitish(Vector3.new(math.huge, 0, 0))).toBeFalsy()
+			expect(ShotCodec.IsUnitish(Vector3.new(0, 0, 5))).toBeFalsy()
+			expect(ShotCodec.IsUnitish("not a vector")).toBeFalsy()
+			expect(ShotCodec.IsUnitish(Vector3.new(0, 0, -1))).toBeTruthy()
+			expect(ShotCodec.IsFinite(Vector3.new(nan, 1, 1))).toBeFalsy()
+			expect(ShotCodec.IsFinite(Vector3.new(10, 20, 30))).toBeTruthy()
+		end)
+	end)
+
 	describe("Ballistics", function()
 		it("spread stays inside the weapon's cone", function()
 			local dir = Vector3.new(0.3, 0.2, -1).Unit

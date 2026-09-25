@@ -13,6 +13,8 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Weapons = require(Shared.Config.Weapons)
 local Cosmetics = require(Shared.Config.Cosmetics)
 local Ballistics = require(Shared.Ballistics)
+local ShotCodec = require(Shared.ShotCodec)
+local Factions = require(Shared.Paint.Factions)
 local Net = require(Shared.Net)
 local Palette = require(script.Parent.Palette)
 
@@ -42,10 +44,10 @@ local folder: Folder
 local blobs: { Blob } = {}
 local pool: { Part } = {}
 local emitterAttachment: Attachment
-local splatEmitter: ParticleEmitter
-local starEmitter: ParticleEmitter
-local rayParams = RaycastParams.new()
-rayParams.FilterType = Enum.RaycastFilterType.Exclude
+-- One emitter per (relation, style). A ParticleEmitter's Color applies to particles already
+-- in flight, so a shared emitter would flip old splats to the newest splat's colour.
+local emitters: { [string]: ParticleEmitter } = {}
+local RELATIONS: { Factions.Relation } = { "Friendly", "Hostile", "None" }
 
 local function takePart(): Part
 	local p = table.remove(pool)
@@ -74,11 +76,14 @@ local function myPaintEffect(): string
 	return if item then item.Visual.SplatStyle or "Classic" else "Classic"
 end
 
--- Burst of paint droplets at a point.
-function Effects.Splat(position: Vector3, color: Color3, amount: number, stars: boolean?)
+-- Burst of paint droplets at a point, in the perspective colour of `owner`'s paint.
+function Effects.Splat(position: Vector3, owner: number, amount: number, stars: boolean?)
+	local relation = Factions.Relation(owner, Palette.MyFaction())
+	local emitter = emitters[relation .. (if stars then "Stars" else "Blob")]
+	if not emitter then
+		return
+	end
 	emitterAttachment.WorldPosition = position
-	local emitter = if stars then starEmitter else splatEmitter
-	emitter.Color = ColorSequence.new(color)
 	emitter:Emit(math.clamp(math.floor(amount), 1, 80))
 end
 
@@ -112,7 +117,7 @@ end
 
 local function impact(b: Blob, at: Vector3)
 	local stars = b.Owner == player.UserId and myPaintEffect() == "Stars"
-	Effects.Splat(at, Palette.ForFaction(b.Faction), 4 + b.Weapon.PaintRadius * 2, stars)
+	Effects.Splat(at, b.Faction, 4 + b.Weapon.PaintRadius * 2, stars)
 end
 
 local function stepAll(dt: number)
@@ -125,6 +130,24 @@ local function stepAll(dt: number)
 	if camera then
 		table.insert(ignore, camera)
 	end
+	-- One raycast filter per shooter per frame (their own character is excluded).
+	local filters: { [number]: RaycastParams } = {}
+	local function filterFor(ownerId: number): RaycastParams
+		local cached = filters[ownerId]
+		if cached then
+			return cached
+		end
+		local f = RaycastParams.new()
+		f.FilterType = Enum.RaycastFilterType.Exclude
+		local list = table.clone(ignore)
+		local shooter = Players:GetPlayerByUserId(ownerId)
+		if shooter and shooter.Character then
+			table.insert(list, shooter.Character)
+		end
+		f.FilterDescendantsInstances = list
+		filters[ownerId] = f
+		return f
+	end
 	local now = os.clock()
 	for i = #blobs, 1, -1 do
 		local b = blobs[i]
@@ -132,18 +155,12 @@ local function stepAll(dt: number)
 		local pos = b.Part.Position
 		local remove = now - b.Born > 8
 		if weapon.Kind == "Thrown" and now - b.Born >= (weapon.Fuse or 1.5) then
-			Effects.Splat(pos, Palette.ForFaction(b.Faction), 60)
+			Effects.Splat(pos, b.Faction, 60)
 			remove = true
 		end
 		if not remove then
 			local newPos, newVel = Ballistics.Step(pos, b.Velocity, weapon.Gravity, dt)
-			local shooter = Players:GetPlayerByUserId(b.Owner)
-			local list = table.clone(ignore)
-			if shooter and shooter.Character then
-				table.insert(list, shooter.Character)
-			end
-			rayParams.FilterDescendantsInstances = list
-			local hit = workspace:Raycast(pos, newPos - pos, rayParams)
+			local hit = workspace:Raycast(pos, newPos - pos, filterFor(b.Owner))
 			if hit then
 				if weapon.Kind == "Thrown" and not Players:GetPlayerFromCharacter(hit.Instance.Parent) then
 					b.Velocity = Ballistics.Bounce(newVel, hit.Normal, weapon.Bounciness or 0.4)
@@ -197,21 +214,34 @@ function Effects.Init()
 	emitterAttachment = Instance.new("Attachment")
 	emitterAttachment.Name = "PaintFxEmitter"
 	emitterAttachment.Parent = workspace.Terrain
-	splatEmitter = makeEmitter("rbxasset://textures/particles/smoke_main.dds", emitterAttachment)
-	starEmitter = makeEmitter("rbxasset://textures/particles/sparkles_main.dds", emitterAttachment)
+	for _, relation in RELATIONS do
+		emitters[relation .. "Blob"] = makeEmitter("rbxasset://textures/particles/smoke_main.dds", emitterAttachment)
+		emitters[relation .. "Stars"] =
+			makeEmitter("rbxasset://textures/particles/sparkles_main.dds", emitterAttachment)
+	end
+	local function colourEmitters()
+		for _, relation in RELATIONS do
+			local c = ColorSequence.new(Palette.ForRelation(relation :: Factions.Relation))
+			emitters[relation .. "Blob"].Color = c
+			emitters[relation .. "Stars"].Color = c
+		end
+	end
+	colourEmitters()
+	Palette.Changed:Connect(colourEmitters)
 
-	Net.Event("ProjectileFired").OnClientEvent
-		:Connect(function(userId: number, weaponId: string, origin: Vector3, velocity: Vector3)
-			if userId == player.UserId then
+	Net.Event("ProjectileFired").OnClientEvent:Connect(function(data: buffer)
+		ShotCodec.Decode(data, function(shot)
+			if shot.UserId == player.UserId then
 				return -- our own shots were drawn the instant we fired
 			end
-			local shooter = Players:GetPlayerByUserId(userId)
+			local shooter = Players:GetPlayerByUserId(shot.UserId)
 			local faction = shooter and (shooter:GetAttribute("Faction") :: number?) or 0
-			Effects.SpawnProjectile(userId, faction, weaponId, origin, velocity)
+			Effects.SpawnProjectile(shot.UserId, faction, shot.WeaponId, shot.Origin, shot.Velocity)
 		end)
+	end)
 
 	Net.Event("PaintImpact").OnClientEvent:Connect(function(position: Vector3, radius: number, faction: number)
-		Effects.Splat(position, Palette.ForFaction(faction), radius * 4)
+		Effects.Splat(position, faction, radius * 4)
 	end)
 
 	RunService.RenderStepped:Connect(stepAll)

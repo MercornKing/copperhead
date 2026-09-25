@@ -34,7 +34,7 @@ local function splashSomewhere()
 		target = workspace:Raycast(origin, Vector3.new(math.cos(angle), 0, math.sin(angle)) * 150, params)
 	end
 	if target then
-		S.Paint.PaintSphere(target.Position, 7, Factions.ENVIRONMENT, nil)
+		S.Paint.PaintSphere(target.Position, 7, Factions.ENVIRONMENT, nil, target.Normal)
 	end
 end
 

@@ -23,6 +23,8 @@ local PaintCodec = require(Shared.Paint.PaintCodec)
 local PaintService = {}
 
 local registry: PaintRegistry.Registry
+local losParams = RaycastParams.new()
+losParams.FilterType = Enum.RaycastFilterType.Include
 local state: PaintState.State
 local painterOf: { [number]: Player } = {}
 local paintedAt: { [number]: number } = {}
@@ -40,6 +42,8 @@ end
 
 function PaintService.Init(paintableFolder: Instance)
 	registry = PaintRegistry.Assign(paintableFolder, Tuning.Paint.CellSize)
+	-- Line of sight is blocked by all solid arena geometry, paintable or not.
+	losParams.FilterDescendantsInstances = { paintableFolder.Parent or paintableFolder }
 	state = PaintState.new(registry.Total)
 	print(string.format("[Paint] %d paintable parts, %d cells", #registry.Entries, registry.Total))
 end
@@ -48,17 +52,32 @@ function PaintService.Registry(): PaintRegistry.Registry
 	return registry
 end
 
+-- True when nothing solid in the arena lies between two points.
+function PaintService.LineOfSight(from: Vector3, to: Vector3): boolean
+	local offset = to - from
+	local hit = workspace:Raycast(from, offset, losParams)
+	return hit == nil or (hit.Position - from).Magnitude >= offset.Magnitude - 0.05
+end
+
 --[[
-	Paint every surface within `radius` of `point` for `faction`.
+	Paint every surface within `radius` of `point` that is visible from it, for `faction`.
+	Pass the surface `normal` for impacts so the burst starts just off the surface.
 	Returns the number of cells whose owner changed.
 ]]
-function PaintService.PaintSphere(point: Vector3, radius: number, faction: number, painter: Player?): number
+function PaintService.PaintSphere(
+	point: Vector3,
+	radius: number,
+	faction: number,
+	painter: Player?,
+	normal: Vector3?
+): number
 	if faction == 0 then
 		return 0
 	end
+	local origin = if normal then point + normal * 0.3 else point
 	local now = os.clock()
 	local changed = 0
-	for _, cell in PaintRegistry.CellsInSphere(registry, point, radius) do
+	for _, cell in PaintRegistry.CellsInSphere(registry, origin, radius, losParams) do
 		local flipped, previous = PaintState.Hit(state, cell, faction, Tuning.Paint.HitsToFlip)
 		if flipped or previous == faction then
 			if painter then

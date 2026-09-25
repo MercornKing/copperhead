@@ -34,8 +34,6 @@ for i = 0, RING - 1 do
 	table.insert(ringDirs, Vector3.new(math.cos(a), 0, math.sin(a)))
 end
 
-type Contact = { Hostile: boolean, Cell: number? }
-
 -- Returns (touchingHostile, creditedPainter).
 function HazardService.Probe(player: Player): (boolean, Player?)
 	local character = player.Character
@@ -61,8 +59,9 @@ function HazardService.Probe(player: Player): (boolean, Player?)
 		end
 	end
 
-	-- Feet and head.
-	check(workspace:Raycast(pos, Vector3.new(0, -(humanoid.HipHeight + halfHeight + slack), 0), params))
+	-- Feet and head. The foot ray has a floor so it also works on rigs with HipHeight 0 (R6).
+	local footReach = math.max(humanoid.HipHeight + halfHeight, 3) + slack
+	check(workspace:Raycast(pos, Vector3.new(0, -footReach, 0), params))
 	check(workspace:Raycast(pos, Vector3.new(0, halfHeight + 1.6 + slack, 0), params))
 
 	-- Walls at chest and shin height (covers wall-running on either side).
@@ -73,6 +72,14 @@ function HazardService.Probe(player: Player): (boolean, Player?)
 		if i % 2 == 1 then
 			check(workspace:Raycast(shin, dir * reach, params))
 		end
+	end
+
+	-- Wall-running latches onto walls from further out than the body ring reaches, so
+	-- probe sideways to the full wall-run detection distance while running.
+	if S.Movement.StateOf(player) == "WallRun" then
+		local side = root.CFrame.RightVector * (Tuning.Movement.WallRun.DetectDistance + slack)
+		check(workspace:Raycast(pos, side, params))
+		check(workspace:Raycast(pos, -side, params))
 	end
 
 	-- Grappling onto hostile paint hurts for as long as you stay attached.

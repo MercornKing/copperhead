@@ -40,6 +40,7 @@ local allocator = Factions.NewAllocator()
 local releasedThisMatch: { number } = {}
 local teamScores: { [number]: number } = {}
 local respawnTokens: { [Player]: number } = {}
+local lastSpawn: { [Player]: number } = {}
 
 local function setState(key: string, value: any)
 	stateFolder:SetAttribute(key, value)
@@ -225,6 +226,13 @@ function MatchService.Spawn(player: Player)
 	if player.Parent ~= Players then
 		return
 	end
+	-- A joiner can be spawned by both the join handler and a phase change in the same
+	-- moment; one spawn is enough.
+	local now = os.clock()
+	if now - (lastSpawn[player] or 0) < 0.5 then
+		return
+	end
+	lastSpawn[player] = now
 	respawnTokens[player] = (respawnTokens[player] or 0) + 1
 	if MatchService.FactionOf(player) == 0 then
 		assignFaction(player)
@@ -514,6 +522,7 @@ function MatchService.Start()
 
 	Players.PlayerRemoving:Connect(function(player)
 		respawnTokens[player] = nil
+		lastSpawn[player] = nil
 		if not mode.Teams then
 			local f = MatchService.FactionOf(player)
 			if f ~= 0 then

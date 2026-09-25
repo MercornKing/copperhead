@@ -16,6 +16,23 @@ local Harness = {}
 local cache: { [string]: any } = {}
 local loadFile: (path: string) -> any
 
+-- Lune's fs calls yield, and yielding inside __index is not allowed, so index the source
+-- tree once up front and resolve `script.Parent.X` against this table.
+local files: { [string]: boolean } = {}
+local dirs: { [string]: boolean } = {}
+local function indexTree(dir: string)
+	dirs[dir] = true
+	for _, name in fs.readDir(dir) do
+		local path = dir .. "/" .. name
+		if fs.isDir(path) then
+			indexTree(path)
+		else
+			files[path] = true
+		end
+	end
+end
+indexTree("src")
+
 local function dirname(path: string): string
 	return string.match(path, "^(.*)/[^/]+$") or "."
 end
@@ -38,11 +55,11 @@ function Harness.DirShim(dir: string): any
 				return Harness.DirShim(dirname(dir))
 			end
 			local file = dir .. "/" .. key .. ".luau"
-			if fs.isFile(file) then
+			if files[file] then
 				return scriptShimFor(file)
 			end
 			local sub = dir .. "/" .. key
-			if fs.isDir(sub) then
+			if dirs[sub] then
 				return Harness.DirShim(sub)
 			end
 			error("harness: no module or folder '" .. key .. "' in " .. dir)

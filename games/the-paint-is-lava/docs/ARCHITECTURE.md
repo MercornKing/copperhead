@@ -24,9 +24,11 @@ How the Roblox build implements the [Game Direction](GAME_DIRECTION.md). Written
 
 **Agreement without geometry on the wire.** The server stamps each paintable part with a `PaintOffset` attribute and the folder with totals (`shared/Paint/PaintRegistry.luau`). Clients rebuild the identical layout from replicated part sizes and those attributes, so only `(cellId, faction)` pairs are ever sent.
 
+**Requirement:** Workspace `StreamingEnabled` must stay off (the place ships that way) so every client has every paintable part.
+
 **Replication.** `server/PaintService.luau` batches changed cells and flushes every `BroadcastInterval` (50 ms) as a packed buffer: 5 bytes per changed cell. A joining client asks for a snapshot once its renderer is ready; the snapshot is run-length encoded and chunked, so an empty arena costs 9 bytes.
 
-**Painting.** Weapons call `PaintService.PaintSphere(point, radius, faction, painter)`. A broadphase finds nearby paintable parts; per face, only cells whose centres fall inside the sphere and which the point is on or in front of are painted, so paint never bleeds through a wall. The directly hit cell is always painted, so tiny-radius weapons still leave a mark.
+**Painting.** Weapons call `PaintService.PaintSphere(point, radius, faction, painter, normal)`. A broadphase finds nearby paintable parts; per face, only cells whose centres fall inside the sphere, which the point is on or in front of, and which have a clear line of sight from the burst are painted. So a launcher hit on one side of a wall never paints the floor behind it. The directly hit cell is always painted, so tiny-radius weapons still leave a mark.
 
 **Rendering.** `client/PaintRenderer.luau` mirrors the state and draws each painted cell as a thin, pooled, non-colliding tile, coloured by perspective (`client/Palette.luau`): Friendly is the safe colour, Hostile the danger colour. Changing faction or palette recolours in place. Per-cell shade variation keeps big areas from looking flat.
 
@@ -36,9 +38,9 @@ How the Roblox build implements the [Game Direction](GAME_DIRECTION.md). Written
 
 ## Combat
 
-`server/CombatService.luau` is authoritative. Clients send intent (`Fire`, `Reload`, `ThrowGrenade`, `Swing`); the server checks the weapon is actually held, rate of fire (20% jitter tolerance), ammo, and that the origin is near the character, then simulates every projectile with the same `shared/Ballistics.luau` the client uses for visuals. A hit on a hostile player deals direct damage (plus splash for explosive weapons); a hit on the arena paints it (plus splash damage). Paint flies through teammates. All damage, including hazard damage, goes through one `DealDamage` function that honours spawn protection and the Results phase.
+`server/CombatService.luau` is authoritative. Clients send intent (`Fire`, `Reload`, `ThrowGrenade`, `Swing`); the server checks the weapon is actually held, the direction vectors are finite and unit length, rate of fire (a two-shot token bucket, so jitter is absorbed but sustained rate never exceeds the weapon's), ammo, and that the origin is near the head with no wall in between, then simulates every projectile with the same `shared/Ballistics.luau` the client uses for visuals. A hit on a hostile player deals direct damage (plus splash for explosive weapons); a hit on the arena paints it (plus splash damage). Splash damage needs line of sight from the burst. Paint flies through teammates and the bodies of eliminated players. All damage, including hazard damage, goes through one `DealDamage` function that honours spawn protection and the Results phase.
 
-The client predicts ammo and rate of fire and draws its own projectiles instantly; `AmmoSync` corrects drift.
+The client predicts ammo and rate of fire and draws its own projectiles instantly. The server answers every rejected shot, throw or reload with `AmmoSync`, so the prediction can't drift. Other players' shots arrive batched: one `ProjectileFired` buffer per server frame (`shared/ShotCodec.luau`, 33 bytes per shot).
 
 ## Movement
 
@@ -48,7 +50,7 @@ Roblox gives each client physics ownership of its own character, so movement run
 - **Wall-run:** airborne, pushing forward, moving fast enough, wall within reach on the left or right: a `LinearVelocity` drives the character along the wall with a slight sink, capped by `MaxDuration`. Jump pushes off the wall. Camera rolls toward the wall.
 - **Grapple:** camera raycast to any arena geometry within range; a `RopeConstraint` with the winch enabled gives both pull and swing. Release on key-up, jump (with a hop), or `MaxAttachSeconds`.
 
-The client reports its movement state and grapple anchor to `server/MovementService.luau`, which validates the anchor (part is in the arena, point is on the part, within range), draws the rope for everyone else, and hands the anchor to the hazard check. It also measures wall-run distance and grapple count for achievements.
+The client reports its movement state and grapple anchor to `server/MovementService.luau`, which validates the anchor (part is in the arena, point is on the part, within range), draws the rope for everyone else, and hands the anchor to the hazard check. It also measures wall-run distance and grapple count for achievements, counting them only when its own raycasts agree (a wall beside you and no floor under you; a grapple that was a real distance and held for a moment), so a modified client can't farm cosmetics.
 
 ## Matches
 
@@ -69,7 +71,7 @@ The client reports its movement state and grapple anchor to `server/MovementServ
 - One byte per cell and 253 player factions per server; FFA ids are recycled only if the pool runs dry.
 - Paint traffic scales with how much paint changes, not with player count: one batched delta per 50 ms for everyone.
 - Hazard probes cost about 20 short raycasts per player per tick against a small include-list.
-- Projectiles are simulated server-side as plain data (no parts), so a firefight costs maths, not instances.
+- Projectiles are simulated server-side as plain data (no parts), so a firefight costs maths, not instances, and every shot fired in a frame is broadcast in one packed event.
 
 The practical cap is the Roblox server size set in Game Settings and what stays readable. Measure before raising it (see [PLAYTEST_PLAN.md](PLAYTEST_PLAN.md)).
 

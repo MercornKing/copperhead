@@ -136,7 +136,10 @@ local function fire()
 	end
 	ViewModel.Kick(math.clamp(w.DirectDamage / 60, 0.08, 0.8))
 	if ammo[w.Id] <= 0 then
-		reloadingUntil[w.Id] = now + w.ReloadTime -- server auto-reloads too
+		-- The server auto-reloads when it also reaches zero; asking explicitly covers the
+		-- case where it dropped one of our shots and still thinks there's paint left.
+		reloadingUntil[w.Id] = now + w.ReloadTime
+		Net.Event("Reload"):FireServer(w.Id)
 	end
 	if not w.Automatic then
 		firing = false

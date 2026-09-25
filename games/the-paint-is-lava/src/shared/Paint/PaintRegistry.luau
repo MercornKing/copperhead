@@ -103,9 +103,17 @@ function PaintRegistry.Mirror(folder: Instance): Registry
 	end
 	local expected = folder:GetAttribute("PaintPartCount") :: number
 	local parts = collectParts(folder)
-	while #parts < expected do
+	local deadline = os.clock() + 15
+	while #parts < expected and os.clock() < deadline do
 		task.wait(0.1)
 		parts = collectParts(folder)
+	end
+	if #parts < expected then
+		-- Offsets come from attributes, so a partial registry still agrees with the server
+		-- for every part we do have. Usually means Workspace.StreamingEnabled is on.
+		warn(
+			string.format("[Paint] only %d of %d paintable parts replicated; is StreamingEnabled on?", #parts, expected)
+		)
 	end
 
 	local cellSize = folder:GetAttribute("PaintCellSize") :: number
@@ -131,15 +139,42 @@ function PaintRegistry.CellFromHit(reg: Registry, part: BasePart, position: Vect
 	return PaintGrid.CellAt(entry.Layout, face, cf:PointToObjectSpace(position))
 end
 
--- Every cell on every paintable surface within `radius` of a world point.
-function PaintRegistry.CellsInSphere(reg: Registry, point: Vector3, radius: number): { number }
+--[[
+	Every cell on every paintable surface within `radius` of a world point.
+	With `losParams`, a cell is only painted if it can be seen from the burst point, so
+	a blast on one side of a wall never paints the floor (or anything else) behind it.
+	`losParams` should include all solid arena geometry.
+]]
+function PaintRegistry.CellsInSphere(
+	reg: Registry,
+	point: Vector3,
+	radius: number,
+	losParams: RaycastParams?
+): { number }
 	local out: { number } = {}
 	-- Pad the broadphase slightly so a hit landing exactly on a face edge still finds it.
 	local parts = workspace:GetPartBoundsInRadius(point, radius + 0.5, reg.Overlap)
 	for _, part in parts do
 		local entry = reg.ByPart[part]
 		if entry then
-			PaintGrid.CellsInSphere(entry.Layout, part.CFrame:PointToObjectSpace(point), radius, out)
+			local cf = part.CFrame
+			local found: { number } = {}
+			PaintGrid.CellsInSphere(entry.Layout, cf:PointToObjectSpace(point), radius, found)
+			for _, cell in found do
+				local visible = true
+				if losParams then
+					local center, face = PaintGrid.CellGeometry(entry.Layout, cell)
+					if center and face then
+						local target = cf * (center + face.N * 0.15)
+						local offset = target - point
+						local hit = workspace:Raycast(point, offset, losParams)
+						visible = hit == nil or (hit.Position - point).Magnitude >= offset.Magnitude - 0.05
+					end
+				end
+				if visible then
+					table.insert(out, cell)
+				end
+			end
 		end
 	end
 	return out
