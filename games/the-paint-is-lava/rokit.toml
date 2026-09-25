@@ -1,6 +1,0 @@
-# Toolchain pins. Install Rokit (https://github.com/rojo-rbx/rokit), then run `rokit install`.
-[tools]
-rojo = "rojo-rbx/rojo@7.4.4"
-stylua = "JohnnyMorganz/StyLua@2.5.2"
-lune = "lune-org/lune@0.9.3"
-luau-lsp = "JohnnyMorganz/luau-lsp@1.70.0"
