@@ -1,2 +1,0 @@
--- Replaces Roblox's default health-regeneration script. Regeneration is server-driven
--- from Tuning.Health (server/CombatService.luau) so it can be tuned in one place.
