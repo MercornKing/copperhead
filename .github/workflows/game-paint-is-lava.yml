@@ -1,0 +1,63 @@
+name: Game - The Paint Is Lava (Roblox)
+
+# Checks for the Roblox game in games/the-paint-is-lava. Path-filtered so it never runs
+# for copperhead changes, and copperhead's own CI is untouched.
+on:
+  pull_request:
+    paths:
+      - 'games/the-paint-is-lava/**'
+      - '.github/workflows/game-paint-is-lava.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'games/the-paint-is-lava/**'
+      - '.github/workflows/game-paint-is-lava.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: games/the-paint-is-lava
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Roblox toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          cd "$HOME/bin"
+          curl -sSfL -o rojo.zip https://github.com/rojo-rbx/rojo/releases/download/v7.4.4/rojo-7.4.4-linux-x86_64.zip
+          curl -sSfL -o lune.zip https://github.com/lune-org/lune/releases/download/v0.9.3/lune-0.9.3-linux-x86_64.zip
+          curl -sSfL -o stylua.zip https://github.com/JohnnyMorganz/StyLua/releases/download/v2.5.2/stylua-linux-x86_64.zip
+          curl -sSfL -o lsp.zip https://github.com/JohnnyMorganz/luau-lsp/releases/download/1.70.0/luau-lsp-linux-x86_64.zip
+          for z in *.zip; do unzip -o -q "$z"; done
+          chmod +x rojo lune stylua luau-lsp
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Download Roblox API types
+        run: curl -sSfL -o globalTypes.d.luau https://raw.githubusercontent.com/JohnnyMorganz/luau-lsp/1.70.0/scripts/globalTypes.d.luau
+
+      - name: Unit tests
+        run: lune run tests/run.luau
+
+      - name: Formatting
+        run: stylua --check src tests
+
+      - name: Type check (strict, Roblox API)
+        run: |
+          set -euo pipefail
+          rojo sourcemap default.project.json -o sourcemap.json --include-non-scripts
+          out=$(luau-lsp analyze --platform=roblox --sourcemap=sourcemap.json --defs=globalTypes.d.luau src/ 2>&1 | grep -v '^\[' || true)
+          if [ -n "$out" ]; then echo "$out"; exit 1; fi
+
+      - name: Build place file
+        run: rojo build default.project.json -o ThePaintIsLava.rbxl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ThePaintIsLava-place
+          path: games/the-paint-is-lava/ThePaintIsLava.rbxl
